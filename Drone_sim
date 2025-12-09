@@ -1,0 +1,433 @@
+import time
+import math
+import numpy as np
+import cv2
+import mediapipe as mp
+import pygame
+
+# -----------------------------
+# Simulation parameters
+# -----------------------------
+SCREEN_WIDTH = 1000
+SCREEN_HEIGHT = 700
+FPS = 60
+
+GRAVITY = 9.81
+SCALE = 50.0  # pixels per meter
+
+MASS = 1.2
+MOMENT_INERTIA = 0.02
+MAX_THRUST = 20.0
+MAX_TORQUE = 1.5
+LINEAR_DRAG = 0.8
+ANGULAR_DRAG = 0.05
+
+# World mapping for user gestures -> target setpoints (meters)
+ALT_MIN = -1.0   # lowest altitude (meters)
+ALT_MAX = 3.0    # highest altitude (meters)
+X_MIN = -3.0     # left-most x (meters)
+X_MAX = 3.0      # right-most x (meters)
+
+# PID defaults (tweak if needed)
+PID_X = dict(kp=0.9, ki=0.0, kd=0.18, integrator_limit=0.6, output_limit=math.radians(30))
+PID_ANGLE = dict(kp=6.0, ki=0.04, kd=1.2, integrator_limit=0.5, output_limit=1.0)
+PID_ALT = dict(kp=1.6, ki=0.45, kd=0.6, integrator_limit=1.0, output_limit=1.0)
+
+HOVER_THROTTLE = MASS * GRAVITY / MAX_THRUST  # baseline throttle to counter gravity
+
+# Smoothing factors for gesture inputs (0..1, closer to 1 => smoother)
+SMOOTH_ALPHA_ALT = 0.7
+SMOOTH_ALPHA_X = 0.7
+
+# Deadzone for lateral control (normalized)
+DEADZONE_X = 0.05
+
+
+# -----------------------------
+# Utility helpers
+# -----------------------------
+def clamp(v, a, b):
+    return max(a, min(b, v))
+
+
+def world_to_screen(x_m, y_m):
+    px = SCREEN_WIDTH // 2 + x_m * SCALE
+    py = SCREEN_HEIGHT // 2 - y_m * SCALE
+    return int(px), int(py)
+
+
+# -----------------------------
+# Simple PID class
+# -----------------------------
+class PID:
+    def __init__(self, kp, ki, kd, integrator_limit=None, output_limit=None):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.integrator = 0.0
+        self.prev_error = None
+        self.integrator_limit = integrator_limit
+        self.output_limit = output_limit
+
+    def reset(self):
+        self.integrator = 0.0
+        self.prev_error = None
+
+    def update(self, error, dt):
+        de = 0.0
+        if self.prev_error is not None and dt > 0:
+            de = (error - self.prev_error) / dt
+        self.prev_error = error
+
+        self.integrator += error * dt
+        if self.integrator_limit is not None:
+            self.integrator = clamp(self.integrator, -self.integrator_limit, self.integrator_limit)
+
+        out = self.kp * error + self.ki * self.integrator + self.kd * de
+
+        if self.output_limit is not None:
+            out = clamp(out, -self.output_limit, self.output_limit)
+        return out
+
+
+# -----------------------------
+# Drone model (2D)
+# -----------------------------
+class Drone2D:
+    def __init__(self):
+        # world state
+        self.x = 0.0
+        self.y = 0.0
+        self.vx = 0.0
+        self.vy = 0.0
+        self.angle = 0.0  # radians (0 pointing up)
+        self.omega = 0.0
+
+        self.mass = MASS
+        self.I = MOMENT_INERTIA
+
+        self.body_length = 0.4
+        self.body_width = 0.18
+
+    def reset(self):
+        self.__init__()
+
+    def apply_controls(self, throttle, torque, dt):
+        throttle = clamp(throttle, 0.0, 1.0)
+        torque = clamp(torque, -1.0, 1.0)
+
+        thrust = throttle * MAX_THRUST
+        ux = math.sin(self.angle)
+        uy = math.cos(self.angle)
+
+        Fx = thrust * ux
+        Fy = thrust * uy - self.mass * GRAVITY
+
+        Fx -= LINEAR_DRAG * self.vx
+        Fy -= LINEAR_DRAG * self.vy
+
+        ax = Fx / self.mass
+        ay = Fy / self.mass
+
+        self.vx += ax * dt
+        self.vy += ay * dt
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+
+        applied_torque = torque * MAX_TORQUE
+        applied_torque -= ANGULAR_DRAG * self.omega
+        alpha = applied_torque / self.I
+        self.omega += alpha * dt
+        self.angle += self.omega * dt
+        self.angle = (self.angle + math.pi) % (2 * math.pi) - math.pi
+
+    def draw(self, surf):
+        L = self.body_length
+        W = self.body_width
+        pts_body = [(0.0, L/2), (-W/2, -L/2), (W/2, -L/2)]
+        pts_screen = []
+        for bx, by in pts_body:
+            wx = bx * math.cos(self.angle) - by * math.sin(self.angle)
+            wy = bx * math.sin(self.angle) + by * math.cos(self.angle)
+            sx, sy = world_to_screen(self.x + wx, self.y + wy)
+            pts_screen.append((sx, sy))
+        pygame.draw.polygon(surf, (60, 160, 220), pts_screen)
+        cx, cy = world_to_screen(self.x, self.y)
+        pygame.draw.circle(surf, (0, 0, 0), (cx, cy), 3)
+        thrust_len = 0.6
+        tx = thrust_len * math.sin(self.angle)
+        ty = thrust_len * math.cos(self.angle)
+        tx_s, ty_s = world_to_screen(self.x + tx, self.y + ty)
+        pygame.draw.line(surf, (255, 120, 0), (cx, cy), (tx_s, ty_s), 2)
+
+
+# -----------------------------
+# Hand processing mapping
+# -----------------------------
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+def detect_fist(landmarks):
+    # heuristic: index_tip to wrist distance small => closed
+    d_idx_wrist = math.dist((landmarks[8].x, landmarks[8].y), (landmarks[0].x, landmarks[0].y))
+    d_thumb_pinky = math.dist((landmarks[4].x, landmarks[4].y), (landmarks[20].x, landmarks[20].y))
+    bbox_w = max(p.x for p in landmarks) - min(p.x for p in landmarks)
+    bbox_h = max(p.y for p in landmarks) - min(p.y for p in landmarks)
+    bbox_area = bbox_w * bbox_h
+    return (d_idx_wrist < 0.06) or (d_thumb_pinky < 0.08) or (bbox_area < 0.004)
+
+
+def hand_to_normpos(landmarks):
+    """Return normalized center x,y (0..1). Use landmark 9 (MCP middle) as stable center."""
+    xs = [p.x for p in landmarks]
+    ys = [p.y for p in landmarks]
+    cx = float(np.mean(xs))
+    cy = float(np.mean(ys))
+    # also return bbox area
+    bbox_w = max(xs) - min(xs)
+    bbox_h = max(ys) - min(ys)
+    return cx, cy, bbox_w * bbox_h
+
+
+# -----------------------------
+# Main: combine webcam, hand detection and control loops
+# -----------------------------
+def main():
+    pygame.init()
+    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+    pygame.display.set_caption("2D Drone Simulator — Two-Hand Gesture Control")
+    clock = pygame.time.Clock()
+    font = pygame.font.SysFont("consolas", 16)
+
+    drone = Drone2D()
+
+    # PID controllers
+    pid_x = PID(**PID_X)
+    pid_angle = PID(**PID_ANGLE)
+    pid_alt = PID(**PID_ALT)
+
+    # webcam
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("ERROR: cannot open camera")
+        return
+
+    mp_hand = mp_hands.Hands(min_detection_confidence=0.6, min_tracking_confidence=0.6, max_num_hands=2)
+
+    # smoothing & state
+    smoothed_alt = 0.5  # normalized 0..1 for altitude mapping
+    smoothed_x = 0.5    # normalized 0..1 for lateral mapping
+    last_info = {}
+    calib = None
+    calib_samples = []
+    calib_start = time.time()
+    calib_duration = 1.5
+    show_cam = False
+
+    running = True
+    last_time = time.time()
+    while running:
+        now = time.time()
+        dt = now - last_time
+        last_time = now
+        if dt <= 0:
+            dt = 1.0 / FPS
+
+        # handle pygame events
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                running = False
+            elif ev.type == pygame.KEYDOWN:
+                if ev.key in (pygame.K_ESCAPE, pygame.K_q):
+                    running = False
+                elif ev.key == pygame.K_c:
+                    calib = None
+                    calib_samples = []
+                    calib_start = time.time()
+                    print("Recalibration started")
+                elif ev.key == pygame.K_v:
+                    show_cam = not show_cam
+                elif ev.key == pygame.K_r:
+                    drone.reset()
+                    pid_x.reset(); pid_angle.reset(); pid_alt.reset()
+
+        # capture frame
+        ret, frame = cap.read()
+        if not ret:
+            print("Camera not ready")
+            break
+        frame = cv2.flip(frame, 1)  # mirror for natural control
+        h, w, _ = frame.shape
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = mp_hand.process(frame_rgb)
+
+        # defaults: no hands
+        left_present = False
+        right_present = False
+        left_cx = left_cy = None
+        right_cx = right_cy = None
+        left_closed = right_closed = False
+
+        if results.multi_hand_landmarks:
+            # determine handedness from results.multi_handedness (labels)
+            # Each hand landmark corresponds to an entry in multi_handedness and multi_hand_landmarks in same order.
+            for hand_landmarks, hand_handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+                label = hand_handedness.classification[0].label  # 'Left' or 'Right' from camera view
+                # compute normalized center
+                cx, cy, area = hand_to_normpos(hand_landmarks.landmark)
+                is_closed = detect_fist(hand_landmarks.landmark)
+                if calib is None and (time.time() - calib_start) < calib_duration:
+                    calib_samples.append({'cx': cx, 'cy': cy})
+                if label == 'Left':
+                    left_present = True
+                    left_cx, left_cy = cx, cy
+                    left_closed = is_closed
+                else:
+                    right_present = True
+                    right_cx, right_cy = cx, cy
+                    right_closed = is_closed
+                # draw landmarks for diagnostics
+                mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+            # finish calibration if needed
+            if calib is None and (time.time() - calib_start) >= calib_duration:
+                if calib_samples:
+                    # build separate stats for x and y overall
+                    all_cx = [s['cx'] for s in calib_samples]
+                    all_cy = [s['cy'] for s in calib_samples]
+                    center_x = float(np.mean(all_cx))
+                    min_y = float(min(all_cy))
+                    max_y = float(max(all_cy))
+                    # expand slightly
+                    dy = max_y - min_y if (max_y - min_y) > 1e-6 else 0.1
+                    min_y = max(min_y - 0.05 * dy, 0.0)
+                    max_y = min(max_y + 0.05 * dy, 1.0)
+                    calib = {'center_x': center_x, 'min_y': max_y, 'max_y': min_y}
+                    print("Calibration:", calib)
+                else:
+                    calib = {'center_x': 0.5, 'min_y': 0.8, 'max_y': 0.2}
+
+        # Map gestures to normalized setpoints (0..1)
+        # Right hand vertical -> altitude normalized (0..1) where 1 is high
+        gesture_alt_norm = None
+        gesture_x_norm = None
+        fist_any = False
+
+        if right_present:
+            # map cy (0..1) to throttle normalized 1..0 (top->1)
+            if calib is None:
+                # fallback
+                min_y, max_y, center_x = 0.8, 0.2, 0.5
+            else:
+                min_y = calib['min_y']; max_y = calib['max_y']; center_x = calib['center_x']
+            # invert y: smaller cy => higher in frame => larger altitude
+            alt_norm = (min_y - right_cy) / (min_y - max_y + 1e-6)
+            alt_norm = clamp(alt_norm, 0.0, 1.0)
+            gesture_alt_norm = alt_norm
+            if right_closed:
+                fist_any = True
+
+        if left_present:
+            # left hand x (0..1): left side -> 0, right side -> 1
+            # We interpret left hand relative to camera center (calib center_x)
+            if calib is None:
+                center_x = 0.5
+            # normalized offset around center
+            offset = left_cx - center_x
+            # map to 0..1 with deadzone
+            if abs(offset) < DEADZONE_X:
+                x_norm = 0.5  # no lateral command
+            else:
+                # scale offset from -0.5..0.5 to 0..1
+                x_norm = 0.5 + offset * 1.0
+                x_norm = clamp(x_norm, 0.0, 1.0)
+            gesture_x_norm = x_norm
+            if left_closed:
+                fist_any = True
+
+        # smoothing
+        if gesture_alt_norm is not None:
+            smoothed_alt = SMOOTH_ALPHA_ALT * smoothed_alt + (1 - SMOOTH_ALPHA_ALT) * gesture_alt_norm
+        else:
+            # decay toward 0.0 if no right hand (safety)
+            smoothed_alt = 0.99 * smoothed_alt
+
+        if gesture_x_norm is not None:
+            smoothed_x = SMOOTH_ALPHA_X * smoothed_x + (1 - SMOOTH_ALPHA_X) * gesture_x_norm
+        else:
+            # decay toward center if no left hand
+            smoothed_x = 0.995 * smoothed_x + 0.005 * 0.5
+
+        # map normalized gestures to world setpoints
+        target_altitude = ALT_MIN + smoothed_alt * (ALT_MAX - ALT_MIN)
+        target_x = X_MIN + smoothed_x * (X_MAX - X_MIN)
+
+        # if fist detected on either hand -> cut throttle
+        # also if no right hand, keep altitude target but throttle will come from PID (safe)
+        safety_cut = fist_any
+
+        # ===== Control cascade =====
+        # position -> desired angle
+        x_error = target_x - drone.x
+        desired_angle = pid_x.update(x_error, dt)  # radians
+        desired_angle = clamp(desired_angle, -math.radians(30), math.radians(30))
+
+        # angle PID -> torque (-1..1)
+        angle_err = desired_angle - drone.angle
+        if angle_err > math.pi: angle_err -= 2 * math.pi
+        if angle_err < -math.pi: angle_err += 2 * math.pi
+        torque_unclamped = pid_angle.update(angle_err, dt)
+        torque_cmd = clamp(torque_unclamped, -1.0, 1.0)
+
+        # altitude PID -> throttle around hover baseline
+        alt_err = target_altitude - drone.y
+        alt_pid_out = pid_alt.update(alt_err, dt)
+        throttle_unclamped = HOVER_THROTTLE + alt_pid_out
+        throttle_cmd = clamp(throttle_unclamped, 0.0, 1.0)
+
+        if safety_cut:
+            throttle_cmd = 0.0
+
+        # apply to drone
+        drone.apply_controls(throttle_cmd, torque_cmd, dt)
+
+        # drawing
+        screen.fill((25, 25, 35))
+        ground_px = world_to_screen(0, -SCREEN_HEIGHT/(2*SCALE))[1]
+        pygame.draw.line(screen, (80, 80, 80), (0, ground_px), (SCREEN_WIDTH, ground_px), 2)
+        drone.draw(screen)
+
+        # HUD
+        hud_lines = [
+            f"Target X: {target_x:.2f} m   Target Alt: {target_altitude:.2f} m",
+            f"Throttle: {throttle_cmd:.3f}   Torque: {torque_cmd:.3f}",
+            f"Drone Pos: x={drone.x:.2f} m, y={drone.y:.2f} m",
+            f"Angle: {math.degrees(drone.angle):.1f} deg   ω: {math.degrees(drone.omega):.1f} deg/s",
+            f"Calibration: {'YES' if calib else 'NO'}  (press 'c' to recalibrate)  Camera view: {'ON' if show_cam else 'OFF'}",
+            "Keys: c=recal, v=toggle cam, r=reset, q/ESC=quit"
+        ]
+        for i, ln in enumerate(hud_lines):
+            surf = font.render(ln, True, (220, 220, 220))
+            screen.blit(surf, (10, 8 + i * 18))
+
+        # show small camera preview
+        cam_w = 320
+        cam_h = int(cam_w * h / w)
+        cam_small = cv2.resize(frame, (cam_w, cam_h))
+        cam_small = cv2.cvtColor(cam_small, cv2.COLOR_BGR2RGB)
+        cam_surf = pygame.surfarray.make_surface(np.rot90(cam_small))
+        if show_cam:
+            screen.blit(cam_surf, (SCREEN_WIDTH - cam_w - 10, 10))
+        else:
+            screen.blit(cam_surf, (SCREEN_WIDTH - 160 - 10, 10))
+
+        pygame.display.flip()
+
+    # cleanup
+    mp_hand.close()
+    cap.release()
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    main()
